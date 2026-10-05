@@ -16,12 +16,146 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - name: Download VReader source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: lllyys/vreader
           # 固定已检查的版本；这份工作流可以放在你自己的空仓库中。
           ref: b996ab4d828a180ae4b23d0b07d045b3d318c34f
           persist-credentials: false
+
+      - name: Apply Swift 6 compatibility fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          """为已固定的 VReader 源码应用本次日志对应的编译兼容补丁。"""
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
+          expected_commit = "b996ab4d828a180ae4b23d0b07d045b3d318c34f"
+          actual_commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], cwd=root, text=True
+          ).strip()
+          if actual_commit != expected_commit:
+              raise SystemExit("源码版本与补丁不匹配，请不要对其他版本应用此补丁。")
+
+          changes = {}
+
+
+          def replace(relative_path, old, new, count=1):
+              path = root / relative_path
+              source = changes.get(path, path.read_text())
+              if source.count(old) != count:
+                  raise SystemExit(f"补丁上下文不匹配：{relative_path}")
+              changes[path] = source.replace(old, new)
+
+
+          reader = "vreader/Views/Reader/"
+          epub = reader + "EPUBReaderContainerView.swift"
+          # 保留所有修饰器的先后顺序，用独立的 opaque View 类型缩小单次类型推断范围。
+          replace(epub, "    var body: some View {\n", """    var body: some View {
+                  readerWithPresentation
+              }
+
+              // 分段推断视图类型，避免 Xcode 16.4 对整条修饰器链进行类型检查时超时。
+              private var readerCanvas: some View {
+          """)
+          for marker, previous, following in [
+              ("        .task {", "readerCanvas", "readerWithLifecycle"),
+              ("        .onReceive(NotificationCenter.default.publisher(for: .readerBookmarkRequested))", "readerWithLifecycle", "readerWithNavigation"),
+              ("        // Bug #88: re-render highlights after annotation import", "readerWithNavigation", "readerWithAnnotations"),
+              ("        // Feature #64 WI-8: a tap on a persisted EPUB highlight opens the", "readerWithAnnotations", "readerWithAppearance"),
+              ("        // Feature #56 WI-10: bilingual reading wiring lives in a", "readerWithAppearance", "readerWithPresentation"),
+          ]:
+              replace(epub, marker, f"    }}\n\n    private var {following}: some View {{\n        {previous}\n" + marker)
+
+          foliate_path = root / (reader + "FoliateSpikeView.swift")
+          foliate = foliate_path.read_text()
+          pattern = re.compile(
+              r"(^            \) \{ \[weak self\] notification in\n)(.*?)(^            \}\n)",
+              re.DOTALL | re.MULTILINE,
+          )
+
+
+          def isolate_observer(match):
+              body = match.group(2)
+              inner = """                MainActor.assumeIsolated {
+                              self.webView?.evaluateJavaScript(js, completionHandler: nil)
+                          }
+          """
+              if body.count(inner) != 1 or "key == self.fingerprintKey" not in body:
+                  raise SystemExit("Foliate 通知补丁上下文不匹配")
+              body = body.replace(inner, "                self.webView?.evaluateJavaScript(js, completionHandler: nil)\n")
+              indented = "".join("    " + line if line.strip() else line for line in body.splitlines(True))
+              return (
+                  match.group(1)
+                  + "                // queue: .main 保证同步回调在主线程；身份校验也必须在隔离范围内。\n"
+                  + "                MainActor.assumeIsolated {\n"
+                  + indented
+                  + "                }\n"
+                  + match.group(3)
+              )
+
+
+          foliate, count = pattern.subn(isolate_observer, foliate)
+          if count != 5:
+              raise SystemExit("Foliate 通知数量与固定源码不匹配")
+          changes[foliate_path] = foliate
+
+          replace(reader + "FoliateViewCoordinator.swift", """        let name = message.name
+                  let body = message.body
+                  Task { @MainActor in
+                      self.handleMessage(name: name, body: body)
+                  }
+          """, """        // WebKit 在主线程投递脚本消息；读取消息与创建后续任务必须处于同一隔离范围。
+                  MainActor.assumeIsolated {
+                      let name = message.name
+                      let body = message.body
+                      Task { @MainActor in
+                          self.handleMessage(name: name, body: body)
+                      }
+                  }
+          """)
+          replace(reader + "PageTurnAnimator.swift", "    static func duration(\n", "    // 默认值读取 UIKit 的辅助功能设置，因此该入口必须在主线程调用。\n    @MainActor static func duration(\n")
+          replace(reader + "ReaderDisplayControls.swift", "    final class Coordinator: NSObject {\n", "    // UIKit 控件事件和 SwiftUI 绑定均由主线程处理。\n    @MainActor final class Coordinator: NSObject {\n")
+          replace(reader + "ReaderScrollIndicatorPolicy.swift", "enum ReaderScrollIndicatorPolicy {\n", "// 遍历 UIKit 视图树和修改滚动控件属性只能在主线程执行。\n@MainActor\nenum ReaderScrollIndicatorPolicy {\n")
+
+          replace(reader + "TXTChunkedReaderBridge.swift", """                self?.clearTemporaryHighlightIfNeeded(scrollView: nil)
+          """, """                // 此通知注册在 .main 队列，保留同步清理时序并声明其主线程隔离。
+                          MainActor.assumeIsolated {
+                              self?.clearTemporaryHighlightIfNeeded(scrollView: nil)
+                          }
+          """)
+          replace(reader + "TXTTextViewBridgeCoordinator.swift", """                self?.clearSearchHighlightIfTemporary()
+                          if let tv = self?.activeTextView {
+                              self?.rebuildHighlights(in: tv)
+                          }
+          """, """                // 此通知注册在 .main 队列，读取 UITextView 和重绘都属于同一次主线程回调。
+                          MainActor.assumeIsolated {
+                              self?.clearSearchHighlightIfTemporary()
+                              if let tv = self?.activeTextView {
+                                  self?.rebuildHighlights(in: tv)
+                              }
+                          }
+          """)
+
+          replace("vreader/ViewModels/ReadiumEPUBReaderViewModel.swift", "import ReadiumShared\n", "// Readium 3.9 的类型缺少完整 Sendable 标注；升级其并发声明后可移除此兼容导入。\n@preconcurrency import ReadiumShared\n")
+          for version in range(1, 11):
+              replace(
+                  f"vreader/Models/Migration/SchemaV{version}.swift",
+                  "import SwiftData\n",
+                  "// iOS 18.5 SDK 的 Schema.Version 尚未标注 Sendable；保持既有版本值与迁移行为。\n@preconcurrency import SwiftData\n",
+              )
+
+          # 先验证全部上下文再写入，避免版本不匹配时只修改了一部分文件。
+          for path, source in changes.items():
+              path.write_text(source)
+              print("Patched:", path.relative_to(root))
+          PY
+          git diff --check
 
       - name: Prepare Xcode project
         shell: bash
@@ -52,6 +186,14 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             2>&1 | tee "$RUNNER_TEMP/vreader-build.log"
 
+      - name: Show compiler errors on failure
+        if: failure()
+        shell: bash
+        run: |
+          if [[ -f "$RUNNER_TEMP/vreader-build.log" ]]; then
+            /usr/bin/grep -n -m 40 'error:' "$RUNNER_TEMP/vreader-build.log" || true
+          fi
+
       - name: Verify and package IPA
         shell: bash
         run: |
@@ -71,7 +213,7 @@ jobs:
           /usr/bin/unzip -t "$RUNNER_TEMP/vreader-output/vreader-unsigned.ipa"
 
       - name: Upload VReader IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VReader-IPA
           path: ${{ runner.temp }}/vreader-output/vreader-unsigned.ipa
@@ -81,7 +223,7 @@ jobs:
 
       - name: Upload build log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VReader-build-log
           path: ${{ runner.temp }}/vreader-build.log
