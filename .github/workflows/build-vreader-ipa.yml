@@ -1,4 +1,5 @@
 name: Build VReader IPA
+run-name: VReader IPA - revision 2
 
 # 只在手动点击时编译，避免每次提交都启动 Mac 打包任务。
 on:
@@ -88,16 +89,24 @@ jobs:
           """
               if body.count(inner) != 1 or "key == self.fingerprintKey" not in body:
                   raise SystemExit("Foliate 通知补丁上下文不匹配")
-              body = body.replace(inner, "                self.webView?.evaluateJavaScript(js, completionHandler: nil)\n")
-              indented = "".join("    " + line if line.strip() else line for line in body.splitlines(True))
-              return (
-                  match.group(1)
-                  + "                // queue: .main 保证同步回调在主线程；身份校验也必须在隔离范围内。\n"
-                  + "                MainActor.assumeIsolated {\n"
-                  + indented
-                  + "                }\n"
-                  + match.group(3)
-              )
+              # Notification.userInfo 包含 Any，不能捕获到隔离闭包；先在原回调提取 Sendable 值。
+              simple_filter = """                      let key = info["fingerprintKey"] as? String,
+                                key == self.fingerprintKey else { return }
+          """
+              target_filter = "                      key == self.fingerprintKey,\n"
+              if simple_filter in body:
+                  body = body.replace(simple_filter, "                      let key = info[\"fingerprintKey\"] as? String else { return }\n")
+              elif target_filter in body:
+                  body = body.replace(target_filter, "")
+              else:
+                  raise SystemExit("Foliate 身份筛选上下文不匹配")
+              body = body.replace(inner, """                // .main 队列保证隔离；只捕获 self、key、js，不把非 Sendable 的通知字典带入。
+                          MainActor.assumeIsolated {
+                              guard key == self.fingerprintKey else { return }
+                              self.webView?.evaluateJavaScript(js, completionHandler: nil)
+                          }
+          """)
+              return match.group(1) + body + match.group(3)
 
 
           foliate, count = pattern.subn(isolate_observer, foliate)
