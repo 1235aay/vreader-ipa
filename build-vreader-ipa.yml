@@ -1,0 +1,89 @@
+name: Build VReader IPA
+
+# 只在手动点击时编译，避免每次提交都启动 Mac 打包任务。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Download VReader source
+        uses: actions/checkout@v4
+        with:
+          repository: lllyys/vreader
+          # 固定已检查的版本；这份工作流可以放在你自己的空仓库中。
+          ref: b996ab4d828a180ae4b23d0b07d045b3d318c34f
+          persist-credentials: false
+
+      - name: Prepare Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Build unsigned iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 必须使用真机 SDK；关闭签名后由手机上的 SideStore 重新签名。
+          xcodebuild build \
+            -project vreader.xcodeproj \
+            -scheme vreader \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/vreader-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            2>&1 | tee "$RUNNER_TEMP/vreader-build.log"
+
+      - name: Verify and package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$RUNNER_TEMP/vreader-build/Build/Products/Release-iphoneos/vreader.app"
+          test -d "$app_path"
+          plutil -lint "$app_path/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app_path/Info.plist" | /usr/bin/grep -qx 'iPhoneOS'
+          xcrun lipo -verify_arch arm64 "$app_path/vreader"
+          bash scripts/verify-release-no-debugbridge.sh "$app_path"
+
+          # IPA 的顶层必须是 Payload/，不能直接压缩 .app 或整个构建目录。
+          mkdir -p "$RUNNER_TEMP/vreader-package/Payload" "$RUNNER_TEMP/vreader-output"
+          ditto "$app_path" "$RUNNER_TEMP/vreader-package/Payload/vreader.app"
+          cd "$RUNNER_TEMP/vreader-package"
+          /usr/bin/zip -qry "$RUNNER_TEMP/vreader-output/vreader-unsigned.ipa" Payload
+          /usr/bin/unzip -t "$RUNNER_TEMP/vreader-output/vreader-unsigned.ipa"
+
+      - name: Upload VReader IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VReader-IPA
+          path: ${{ runner.temp }}/vreader-output/vreader-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VReader-build-log
+          path: ${{ runner.temp }}/vreader-build.log
+          if-no-files-found: ignore
+          retention-days: 7
